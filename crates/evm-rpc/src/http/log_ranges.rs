@@ -125,42 +125,30 @@ impl HttpRpcClient {
                     ) {
                         Ok(Some(logs)) => Ok(logs),
                         Ok(None) => Ok(Vec::new()),
-                        Err(original)
-                            if range.span() > FALLBACK_SPAN
-                                && Self::log_range_error_kind(&original).is_some() =>
-                        {
-                            let reason = Self::log_range_error_kind(&original)
-                                .unwrap_or("transient_network");
-                            eprintln!(
-                                "[warn] rpc_log_range_fallback provider={} original_span={} fallback_span={} reason={}",
-                                crate::telemetry::redact_endpoint_host(endpoint),
-                                range.span(),
-                                FALLBACK_SPAN,
-                                reason
-                            );
-                            match self.call_log_chunks(
-                                index,
-                                params,
-                                (&range, FALLBACK_SPAN),
-                                profile,
-                            ) {
-                                Ok(logs) => {
-                                    if reason == "span_limit" {
-                                        self.log_range_limits
-                                            .lock()
-                                            .unwrap_or_else(|e| e.into_inner())
-                                            .insert(
-                                                endpoint_id,
-                                                LogRangeLimit {
-                                                    span: FALLBACK_SPAN,
-                                                    expires_at: Instant::now()
-                                                        + self.log_range_limit_ttl,
-                                                },
-                                            );
-                                    }
-                                    Ok(logs)
+                        Err(original) if range.span() > FALLBACK_SPAN => {
+                            match Self::log_range_error_kind(&original) {
+                                Some("span_limit") => {
+                                    self.probe_log_span(index, (&range, params), original, profile)
                                 }
-                                Err(_) => return Err(original),
+                                Some(reason) => {
+                                    eprintln!(
+                                        "[warn] rpc_log_range_fallback provider={} original_span={} fallback_span={} reason={}",
+                                        crate::telemetry::redact_endpoint_host(endpoint),
+                                        range.span(),
+                                        FALLBACK_SPAN,
+                                        reason
+                                    );
+                                    match self.call_log_chunks(
+                                        index,
+                                        params,
+                                        (&range, FALLBACK_SPAN),
+                                        profile,
+                                    ) {
+                                        Ok(logs) => Ok(logs),
+                                        Err(_) => Err(original),
+                                    }
+                                }
+                                None => Err(original),
                             }
                         }
                         Err(error) => Err(error),
@@ -221,6 +209,50 @@ impl HttpRpcClient {
         Ok(result)
     }
 
+    // Providers reject wide ranges intermittently, so halve the span instead of
+    // pinning the endpoint to the smallest chunk for the whole cache TTL.
+    fn probe_log_span(
+        &self,
+        index: usize,
+        request: (&LogRange, &Value),
+        original: RpcError,
+        profile: &mut ProfileResult,
+    ) -> Result<Vec<Value>, RpcError> {
+        let (range, params) = request;
+        let endpoint = &self.endpoints[index];
+        let mut candidate = (range.span() / 2).max(FALLBACK_SPAN);
+        loop {
+            match self.call_log_chunks(index, params, (range, candidate), profile) {
+                Ok(logs) => {
+                    self.log_range_limits
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(
+                            alloy_primitives::keccak256(endpoint),
+                            LogRangeLimit {
+                                span: candidate,
+                                expires_at: Instant::now() + self.log_range_limit_ttl,
+                            },
+                        );
+                    eprintln!(
+                        "[warn] rpc_log_range_fallback provider={} original_span={} fallback_span={} reason=span_limit",
+                        crate::telemetry::redact_endpoint_host(endpoint),
+                        range.span(),
+                        candidate
+                    );
+                    return Ok(logs);
+                }
+                Err(error) if Self::log_range_error_kind(&error) == Some("span_limit") => {
+                    if candidate == FALLBACK_SPAN {
+                        return Err(original);
+                    }
+                    candidate = (candidate / 2).max(FALLBACK_SPAN);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     fn log_range_error_kind(error: &RpcError) -> Option<&'static str> {
         match error {
             RpcError::RpcProtocol { code, message, .. }
@@ -250,56 +282,217 @@ mod tests {
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
 
-    #[test]
-    fn expired_limit_retries_the_full_range() -> Result<(), Box<dyn std::error::Error>> {
+    fn accepted() -> (u16, String) {
+        (200, r#"{"jsonrpc":"2.0","id":1,"result":[]}"#.to_owned())
+    }
+
+    fn rejected() -> (u16, String) {
+        (
+            200,
+            json!({"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"block range too large"}})
+                .to_string(),
+        )
+    }
+
+    fn log_params(span: u64) -> Value {
+        json!([{"fromBlock": "0x1", "toBlock": format!("0x{:x}", span)}])
+    }
+
+    // Serves `count` sequential JSON-RPC requests and records each `(fromBlock, toBlock)`.
+    fn run_server<T>(
+        count: usize,
+        reply: impl Fn(u64) -> (u16, String) + Send,
+        call: impl FnOnce(HttpRpcClient) -> T,
+    ) -> std::io::Result<(T, Vec<(u64, u64)>)> {
         let listener = TcpListener::bind(("127.0.0.1", 0))?;
         let endpoint = format!("http://{}", listener.local_addr()?);
-        let client = HttpRpcClient::new_live(vec![endpoint.clone()]);
-        let id = alloy_primitives::keccak256(&endpoint);
-        client
-            .log_range_limits
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(
-                id,
-                LogRangeLimit {
-                    span: 10,
-                    expires_at: Instant::now() - Duration::from_secs(1),
-                },
-            );
-        let server = std::thread::spawn(move || -> std::io::Result<String> {
-            let (mut stream, _) = listener.accept()?;
-            let mut reader = BufReader::new(&stream);
-            let mut length = 0;
-            for line in reader.by_ref().lines() {
-                let line = line?;
-                if line.is_empty() {
-                    break;
+        std::thread::scope(|scope| {
+            let server = scope.spawn(move || -> std::io::Result<Vec<(u64, u64)>> {
+                let mut ranges = Vec::new();
+                for _ in 0..count {
+                    let (mut stream, _) = listener.accept()?;
+                    let mut reader = BufReader::new(&stream);
+                    let mut length = 0;
+                    for line in reader.by_ref().lines() {
+                        let line = line?;
+                        if line.is_empty() {
+                            break;
+                        }
+                        if let Some((key, value)) = line.split_once(':')
+                            && key.eq_ignore_ascii_case("content-length")
+                        {
+                            length = value.trim().parse().map_err(std::io::Error::other)?;
+                        }
+                    }
+                    let mut body = vec![0; length];
+                    reader.read_exact(&mut body)?;
+                    let request: Value = serde_json::from_slice(&body)?;
+                    let range = LogRange::parse(&request["params"])
+                        .ok_or_else(|| std::io::Error::other("request lacks a block range"))?;
+                    ranges.push((range.from, range.to));
+                    let (status, body) = reply(range.span());
+                    write!(
+                        stream,
+                        "HTTP/1.1 {status} test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )?;
                 }
-                if let Some((key, value)) = line.split_once(':')
-                    && key.eq_ignore_ascii_case("content-length")
-                {
-                    length = value.trim().parse().map_err(std::io::Error::other)?;
+                Ok(ranges)
+            });
+            let result = call(HttpRpcClient::new_live(vec![endpoint]));
+            let ranges = server
+                .join()
+                .map_err(|_| std::io::Error::other("server thread panicked"))??;
+            Ok((result, ranges))
+        })
+    }
+
+    #[test]
+    fn expired_limit_retries_the_full_range() -> Result<(), Box<dyn std::error::Error>> {
+        let (result, ranges) = run_server(
+            1,
+            |_| accepted(),
+            |client| {
+                let id = alloy_primitives::keccak256(&client.endpoints[0]);
+                client
+                    .log_range_limits
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(
+                        id,
+                        LogRangeLimit {
+                            span: 10,
+                            expires_at: Instant::now() - Duration::from_secs(1),
+                        },
+                    );
+                let logs: Vec<Value> = client.call_single("eth_getLogs", log_params(100))?;
+                Ok::<_, RpcError>((logs, limit_snapshot(id)))
+            },
+        )?;
+        let (logs, limit) = result?;
+        assert!(logs.is_empty());
+        assert_eq!(ranges, [(0x1, 0x64)]);
+        assert!(limit.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn probes_half_span_when_full_range_is_rejected() -> Result<(), Box<dyn std::error::Error>> {
+        let (result, ranges) = run_server(
+            3,
+            |span| if span > 50 { rejected() } else { accepted() },
+            |client| {
+                let id = alloy_primitives::keccak256(&client.endpoints[0]);
+                let logs: Vec<Value> = client.call_single("eth_getLogs", log_params(100))?;
+                Ok::<_, RpcError>((logs, limit_snapshot(id)))
+            },
+        )?;
+        let (logs, limit) = result?;
+        assert!(logs.is_empty());
+        // 100 blocks rejected, then two accepted 50-block chunks.
+        assert_eq!(ranges, [(0x1, 0x64), (0x1, 0x32), (0x33, 0x64)]);
+        assert_eq!(limit.map(|limit| limit.span), Some(50));
+        Ok(())
+    }
+
+    #[test]
+    fn probes_down_to_minimum_span() -> Result<(), Box<dyn std::error::Error>> {
+        let (result, ranges) = run_server(
+            6,
+            |span| if span > 25 { rejected() } else { accepted() },
+            |client| {
+                let id = alloy_primitives::keccak256(&client.endpoints[0]);
+                let logs: Vec<Value> = client.call_single("eth_getLogs", log_params(100))?;
+                Ok::<_, RpcError>((logs, limit_snapshot(id)))
+            },
+        )?;
+        let (logs, limit) = result?;
+        assert!(logs.is_empty());
+        // 100 and 50 rejected, then four accepted 25-block chunks.
+        assert_eq!(
+            ranges,
+            [
+                (0x1, 0x64),
+                (0x1, 0x32),
+                (0x1, 0x19),
+                (0x1a, 0x32),
+                (0x33, 0x4b),
+                (0x4c, 0x64),
+            ]
+        );
+        assert_eq!(limit.map(|limit| limit.span), Some(25));
+        Ok(())
+    }
+
+    #[test]
+    fn cached_span_skips_the_probe() -> Result<(), Box<dyn std::error::Error>> {
+        let (result, ranges) = run_server(
+            4,
+            |_| accepted(),
+            |client| {
+                let id = alloy_primitives::keccak256(&client.endpoints[0]);
+                client
+                    .log_range_limits
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(
+                        id,
+                        LogRangeLimit {
+                            span: 25,
+                            expires_at: Instant::now() + Duration::from_secs(60),
+                        },
+                    );
+                let logs: Vec<Value> = client.call_single("eth_getLogs", log_params(100))?;
+                Ok::<_, RpcError>(logs)
+            },
+        )?;
+        let logs = result?;
+        assert!(logs.is_empty());
+        assert_eq!(
+            ranges,
+            [(0x1, 0x19), (0x1a, 0x32), (0x33, 0x4b), (0x4c, 0x64)]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn transient_http_400_uses_fixed_fallback_without_cache()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (result, ranges) = run_server(
+            11,
+            |span| {
+                if span == 100 {
+                    (400, String::new())
+                } else {
+                    accepted()
                 }
-            }
-            let mut request = vec![0; length];
-            reader.read_exact(&mut request)?;
-            let body = r#"{"jsonrpc":"2.0","id":1,"result":[]}"#;
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            )?;
-            Ok(String::from_utf8_lossy(&request).into_owned())
-        });
-        let _: Vec<Value> =
-            client.call_single("eth_getLogs", json!([{"fromBlock":"0x1","toBlock":"0x64"}]))?;
-        let request = server
-            .join()
-            .map_err(|_| std::io::Error::other("server failed"))??;
-        assert!(request.contains("0x64"));
-        assert!(limit_snapshot(id).is_none());
+            },
+            |client| {
+                let id = alloy_primitives::keccak256(&client.endpoints[0]);
+                let logs: Vec<Value> = client.call_single("eth_getLogs", log_params(100))?;
+                Ok::<_, RpcError>((logs, limit_snapshot(id)))
+            },
+        )?;
+        let (logs, limit) = result?;
+        assert!(logs.is_empty());
+        // The 100-block request fails with HTTP 400, then ten fixed 10-block chunks follow.
+        assert_eq!(
+            ranges,
+            [
+                (0x1, 0x64),
+                (0x1, 0xa),
+                (0xb, 0x14),
+                (0x15, 0x1e),
+                (0x1f, 0x28),
+                (0x29, 0x32),
+                (0x33, 0x3c),
+                (0x3d, 0x46),
+                (0x47, 0x50),
+                (0x51, 0x5a),
+                (0x5b, 0x64),
+            ]
+        );
+        assert!(limit.is_none());
         Ok(())
     }
 }
