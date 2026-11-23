@@ -104,15 +104,41 @@ fn auth_and_rate_limit_errors_do_not_split() -> io::Result<()> {
             1,
             |_, _| (status, json!({})),
             |rpc| {
-                rpc.call_single::<Vec<Value>>(
+                let result = rpc.call_single::<Vec<Value>>(
                     "eth_getLogs",
                     json!([{"fromBlock":"0x1", "toBlock":"0x64"}]),
-                )
+                );
+                (result, rpc.rpc_telemetry_snapshot())
             },
         )?;
-        assert!(result.is_err());
+        assert!(result.0.is_err());
+        assert!(result.1.providers[0].log_range_limit.is_none());
         assert_eq!(requests.len(), 1);
     }
+    Ok(())
+}
+
+#[test]
+fn archive_error_with_range_text_does_not_cache() -> io::Result<()> {
+    let (result, requests) = run_server(
+        1,
+        |_, _| {
+            (
+                200,
+                json!({"id":1,"error":{"code":-32002,"message":"archive block range unavailable"}}),
+            )
+        },
+        |rpc| {
+            let result = rpc.call_single::<Vec<Value>>(
+                "eth_getLogs",
+                json!([{"fromBlock":"0x1","toBlock":"0x64"}]),
+            );
+            (result, rpc.rpc_telemetry_snapshot())
+        },
+    )?;
+    assert!(result.0.is_err());
+    assert!(result.1.providers[0].log_range_limit.is_none());
+    assert_eq!(requests.len(), 1);
     Ok(())
 }
 
@@ -146,9 +172,9 @@ fn invalid_params_range_error_splits_and_failed_retry_returns_original() -> io::
 }
 
 #[test]
-fn unrelated_bad_request_does_not_split() -> io::Result<()> {
+fn unrelated_bad_request_falls_back_and_returns_original_error() -> io::Result<()> {
     let (result, requests) = run_server(
-        1,
+        2,
         |_, _| (400, json!({"error":{"message":"invalid address"}})),
         |rpc| {
             rpc.call_single::<Vec<Value>>(
@@ -158,29 +184,69 @@ fn unrelated_bad_request_does_not_split() -> io::Result<()> {
         },
     )?;
     assert!(result.is_err());
-    assert_eq!(requests.len(), 1);
+    assert_eq!(requests.len(), 2);
     Ok(())
 }
 
 #[test]
-fn result_count_limit_does_not_trigger_block_span_fallback() -> io::Result<()> {
+fn result_count_limit_triggers_fallback() -> io::Result<()> {
     let (result, requests) = run_server(
-        1,
-        |_, _| {
-            (
-                200,
-                json!({"id":1,"error":{"code":-32602,"message":"max results exceeded"}}),
-            )
+        11,
+        |index, _| {
+            if index == 0 {
+                (
+                    200,
+                    json!({"id":1,"error":{"code":-32602,"message":"max results exceeded"}}),
+                )
+            } else {
+                (200, json!({"id":1,"result":[]}))
+            }
         },
         |rpc| {
-            rpc.call_single::<Vec<Value>>(
+            let result = rpc.call_single::<Vec<Value>>(
                 "eth_getLogs",
                 json!([{"fromBlock":"0x1", "toBlock":"0x64"}]),
-            )
+            );
+            (result, rpc.rpc_telemetry_snapshot())
         },
     )?;
-    assert!(result.is_err());
-    assert_eq!(requests.len(), 1);
+    assert!(result.0.is_ok());
+    assert_eq!(requests.len(), 11);
+    let status = serde_json::to_value(result.1)?;
+    assert_eq!(status["providers"][0]["log_range_limit"]["span"], 10);
+    assert!(
+        (1..=900).contains(
+            &status["providers"][0]["log_range_limit"]["expires_in_secs"]
+                .as_u64()
+                .unwrap_or_default()
+        )
+    );
+    Ok(())
+}
+
+#[test]
+fn transient_400_only_splits_current_request() -> io::Result<()> {
+    let (result, requests) = run_server(
+        12,
+        |index, _| {
+            if index == 0 {
+                (400, json!({}))
+            } else {
+                (200, json!({"id":1,"result":[]}))
+            }
+        },
+        |rpc| -> Result<_, evm_rpc::RpcError> {
+            let params = json!([{"fromBlock":"0x1", "toBlock":"0x64"}]);
+            rpc.call_single::<Vec<Value>>("eth_getLogs", params.clone())?;
+            let status = rpc.rpc_telemetry_snapshot();
+            rpc.call_single::<Vec<Value>>("eth_getLogs", params)?;
+            Ok(status)
+        },
+    )?;
+    let status = result.map_err(io::Error::other)?;
+    assert!(status.providers[0].log_range_limit.is_none());
+    assert_eq!(requests[11]["params"][0]["fromBlock"], "0x1");
+    assert_eq!(requests[11]["params"][0]["toBlock"], "0x64");
     Ok(())
 }
 

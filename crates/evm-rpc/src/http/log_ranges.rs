@@ -5,6 +5,31 @@ use std::time::{Duration, Instant};
 
 const FALLBACK_SPAN: u64 = 10;
 
+#[derive(Clone, Copy)]
+pub(super) struct LogRangeLimit {
+    pub(super) span: u64,
+    pub(super) expires_at: Instant,
+}
+
+pub(crate) fn limit_snapshot(
+    endpoint_id: alloy_primitives::B256,
+) -> Option<crate::telemetry::LogRangeLimitSnapshot> {
+    let limits = super::LOG_RANGE_LIMITS.get()?;
+    let mut limits = limits.lock().unwrap_or_else(|e| e.into_inner());
+    let now = Instant::now();
+    limits.retain(|_, limit| limit.expires_at > now);
+    limits
+        .get(&endpoint_id)
+        .map(|limit| crate::telemetry::LogRangeLimitSnapshot {
+            span: limit.span,
+            expires_in_secs: limit
+                .expires_at
+                .duration_since(now)
+                .as_secs()
+                .saturating_add(1),
+        })
+}
+
 pub(super) struct LogRange {
     from: u64,
     to: u64,
@@ -80,12 +105,15 @@ impl HttpRpcClient {
                     continue;
                 }
                 let endpoint = &self.endpoints[index];
-                let limit = self
-                    .log_range_limits
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .get(endpoint)
-                    .copied();
+                let endpoint_id = alloy_primitives::keccak256(endpoint);
+                let limit = {
+                    let mut limits = self
+                        .log_range_limits
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    limits.retain(|_, limit| limit.expires_at > now);
+                    limits.get(&endpoint_id).map(|limit| limit.span)
+                };
                 let result = if let Some(limit) = limit.filter(|limit| range.span() > *limit) {
                     self.call_log_chunks(index, params, (&range, limit), profile)
                 } else {
@@ -99,8 +127,17 @@ impl HttpRpcClient {
                         Ok(None) => Ok(Vec::new()),
                         Err(original)
                             if range.span() > FALLBACK_SPAN
-                                && Self::is_log_range_error(&original) =>
+                                && Self::log_range_error_kind(&original).is_some() =>
                         {
+                            let reason = Self::log_range_error_kind(&original)
+                                .unwrap_or("transient_network");
+                            eprintln!(
+                                "[warn] rpc_log_range_fallback provider={} original_span={} fallback_span={} reason={}",
+                                crate::telemetry::redact_endpoint_host(endpoint),
+                                range.span(),
+                                FALLBACK_SPAN,
+                                reason
+                            );
                             match self.call_log_chunks(
                                 index,
                                 params,
@@ -108,10 +145,19 @@ impl HttpRpcClient {
                                 profile,
                             ) {
                                 Ok(logs) => {
-                                    self.log_range_limits
-                                        .lock()
-                                        .unwrap_or_else(|e| e.into_inner())
-                                        .insert(endpoint.clone(), FALLBACK_SPAN);
+                                    if reason == "span_limit" {
+                                        self.log_range_limits
+                                            .lock()
+                                            .unwrap_or_else(|e| e.into_inner())
+                                            .insert(
+                                                endpoint_id,
+                                                LogRangeLimit {
+                                                    span: FALLBACK_SPAN,
+                                                    expires_at: Instant::now()
+                                                        + self.log_range_limit_ttl,
+                                                },
+                                            );
+                                    }
                                     Ok(logs)
                                 }
                                 Err(_) => return Err(original),
@@ -175,16 +221,85 @@ impl HttpRpcClient {
         Ok(result)
     }
 
-    fn is_log_range_error(error: &RpcError) -> bool {
+    fn log_range_error_kind(error: &RpcError) -> Option<&'static str> {
         match error {
-            RpcError::RpcProtocol { code, message, .. } => {
-                crate::classify::is_block_span_limit_error(*code, message)
+            RpcError::RpcProtocol { code, message, .. }
+                if !crate::classify::is_restricted_rpc_error(*code, message)
+                    && crate::classify::is_range_limit_error(*code, message) =>
+            {
+                Some("span_limit")
             }
             RpcError::RpcNetwork { source, .. } => {
                 let message = source.to_string();
-                message == "HTTP 400" || crate::classify::is_block_span_limit_error(0, &message)
+                if crate::classify::is_range_limit_error(0, &message) {
+                    Some("span_limit")
+                } else if !message.starts_with("HTTP ") || message == "HTTP 400" {
+                    Some("transient_network")
+                } else {
+                    None
+                }
             }
-            _ => false,
+            _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpListener;
+
+    #[test]
+    fn expired_limit_retries_the_full_range() -> Result<(), Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind(("127.0.0.1", 0))?;
+        let endpoint = format!("http://{}", listener.local_addr()?);
+        let client = HttpRpcClient::new_live(vec![endpoint.clone()]);
+        let id = alloy_primitives::keccak256(&endpoint);
+        client
+            .log_range_limits
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                id,
+                LogRangeLimit {
+                    span: 10,
+                    expires_at: Instant::now() - Duration::from_secs(1),
+                },
+            );
+        let server = std::thread::spawn(move || -> std::io::Result<String> {
+            let (mut stream, _) = listener.accept()?;
+            let mut reader = BufReader::new(&stream);
+            let mut length = 0;
+            for line in reader.by_ref().lines() {
+                let line = line?;
+                if line.is_empty() {
+                    break;
+                }
+                if let Some((key, value)) = line.split_once(':')
+                    && key.eq_ignore_ascii_case("content-length")
+                {
+                    length = value.trim().parse().map_err(std::io::Error::other)?;
+                }
+            }
+            let mut request = vec![0; length];
+            reader.read_exact(&mut request)?;
+            let body = r#"{"jsonrpc":"2.0","id":1,"result":[]}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )?;
+            Ok(String::from_utf8_lossy(&request).into_owned())
+        });
+        let _: Vec<Value> =
+            client.call_single("eth_getLogs", json!([{"fromBlock":"0x1","toBlock":"0x64"}]))?;
+        let request = server
+            .join()
+            .map_err(|_| std::io::Error::other("server failed"))??;
+        assert!(request.contains("0x64"));
+        assert!(limit_snapshot(id).is_none());
+        Ok(())
     }
 }

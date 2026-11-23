@@ -5,7 +5,9 @@ use telemetry::{RpcClientTelemetry, RpcTelemetrySnapshot};
 use ureq::Agent;
 mod batch;
 mod log_ranges;
-type LogRangeLimits = Arc<Mutex<std::collections::HashMap<String, u64>>>;
+pub(crate) use log_ranges::limit_snapshot as log_range_limit_snapshot;
+type LogRangeLimits =
+    Arc<Mutex<std::collections::HashMap<alloy_primitives::B256, log_ranges::LogRangeLimit>>>;
 static LOG_RANGE_LIMITS: OnceLock<LogRangeLimits> = OnceLock::new();
 pub use batch::{BatchAttemptError, BatchItemDto};
 #[derive(Debug, serde::Deserialize)]
@@ -49,6 +51,7 @@ pub struct HttpRpcClient {
     archive_heads: Arc<Mutex<std::collections::HashMap<String, (u64, Instant)>>>,
     archive_head_cache_ttl: Duration,
     log_range_limits: LogRangeLimits,
+    log_range_limit_ttl: Duration,
 }
 
 impl std::fmt::Debug for HttpRpcClient {
@@ -111,6 +114,7 @@ impl HttpRpcClient {
             archive_heads: Arc::default(),
             archive_head_cache_ttl: Duration::from_secs(5),
             log_range_limits: Arc::clone(LOG_RANGE_LIMITS.get_or_init(Arc::default)),
+            log_range_limit_ttl: Duration::from_secs(900),
             rotation_anchor: Instant::now(),
             rotation_epoch_secs: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -142,6 +146,12 @@ impl HttpRpcClient {
         self.log_range_limits = Arc::clone(&other.log_range_limits);
         self.rotation_anchor = other.rotation_anchor;
         self.rotation_epoch_secs = other.rotation_epoch_secs;
+        self
+    }
+
+    /// Sets the log range limit TTL, clamped to 60–3600 seconds.
+    pub fn with_log_range_limit_ttl_secs(mut self, seconds: u64) -> Self {
+        self.log_range_limit_ttl = Duration::from_secs(seconds.clamp(60, 3600));
         self
     }
 
@@ -499,22 +509,30 @@ impl HttpRpcClient {
                     }
                     Ok(mut resp) if method == "eth_getLogs" && resp.status().as_u16() == 400 => {
                         let body = resp.body_mut().read_to_string().unwrap_or_default();
-                        if !body.trim().is_empty()
-                            && !crate::classify::is_block_span_limit_error(400, &body)
-                        {
-                            self.mark_other_failure(endpoint);
+                        if crate::classify::is_rate_limit_rpc_error(400, &body) {
+                            Err(ureq::Error::StatusCode(429))
+                        } else if crate::classify::is_restricted_rpc_error(400, &body) {
                             self.telemetry.record_attempt_latency(
                                 attempt_started.elapsed().as_secs_f64() * 1_000.0,
                                 self.slow_threshold_ms,
                             );
-                            last_err = Some(RpcError::RpcNetwork {
+                            last_err = Some(self.status_error(ep_idx, method, 400, &body));
+                            continue;
+                        } else if crate::classify::is_range_limit_error(400, &body) {
+                            self.telemetry.record_attempt_latency(
+                                attempt_started.elapsed().as_secs_f64() * 1_000.0,
+                                self.slow_threshold_ms,
+                            );
+                            last_err = Some(RpcError::RpcProtocol {
                                 endpoint: telemetry::redact_endpoint_host(endpoint),
                                 method: method.to_owned(),
-                                source: Arc::new(std::io::Error::other("HTTP 400 invalid request")),
+                                code: 400,
+                                message: "block range exceeds the maximum".to_owned(),
                             });
                             continue;
+                        } else {
+                            Err(ureq::Error::StatusCode(400))
                         }
-                        Err(ureq::Error::StatusCode(400))
                     }
                     Ok(resp) if resp.status().as_u16() >= 400 => {
                         Err(ureq::Error::StatusCode(resp.status().as_u16()))
@@ -546,10 +564,18 @@ impl HttpRpcClient {
                                 endpoint: telemetry::redact_endpoint_host(endpoint),
                                 method: method.to_owned(),
                                 code: err_obj.code,
-                                message: crate::classify::upstream_summary(
-                                    err_obj.code,
-                                    &err_obj.message,
-                                )
+                                message: if method == "eth_getLogs"
+                                    && crate::classify::is_restricted_rpc_error(
+                                        err_obj.code,
+                                        &err_obj.message,
+                                    ) {
+                                    "access denied"
+                                } else {
+                                    crate::classify::upstream_summary(
+                                        err_obj.code,
+                                        &err_obj.message,
+                                    )
+                                }
                                 .to_owned(),
                             };
                             if crate::classify::is_quota_exhausted_rpc_error(&err_obj.message)

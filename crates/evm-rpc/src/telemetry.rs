@@ -100,6 +100,14 @@ const METHODS: [&str; 15] = [
     "other",
 ];
 
+/// Active endpoint log range limit and remaining lifetime.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogRangeLimitSnapshot {
+    pub span: u64,
+    pub expires_in_secs: u64,
+}
+
 /// Point-in-time RPC rate-limit, slow-call, and endpoint failover telemetry snapshot.
 #[non_exhaustive]
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -118,6 +126,8 @@ pub struct RpcProviderSnapshot {
     endpoint_id: alloy_primitives::B256,
     pub cooldown_active: bool,
     pub cooldown_remaining_secs: u64,
+    #[serde(default)]
+    pub log_range_limit: Option<LogRangeLimitSnapshot>,
 }
 
 #[non_exhaustive]
@@ -366,6 +376,7 @@ impl RpcClientTelemetry {
                         quota_402_count: counters.quota.load(Ordering::Relaxed),
                         cooldown_active: remaining > 0,
                         cooldown_remaining_secs: remaining,
+                        log_range_limit: crate::http::log_range_limit_snapshot(*provider),
                     }
                 })
                 .collect(),
@@ -415,6 +426,17 @@ impl RpcProviderSnapshot {
             .cooldown_remaining_secs
             .max(provider.cooldown_remaining_secs);
         self.cooldown_active = self.cooldown_remaining_secs > 0;
+        if let Some(limit) = &provider.log_range_limit {
+            match &mut self.log_range_limit {
+                Some(current) if current.span <= limit.span => {
+                    if current.span == limit.span {
+                        current.expires_in_secs =
+                            current.expires_in_secs.max(limit.expires_in_secs);
+                    }
+                }
+                _ => self.log_range_limit = Some(limit.clone()),
+            }
+        }
     }
 }
 
