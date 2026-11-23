@@ -46,10 +46,22 @@ fn run_server<T>(
     })
 }
 
+fn requested_span(request: &Value) -> io::Result<u64> {
+    let filter = &request["params"][0];
+    let quantity = |key| -> io::Result<u64> {
+        u64::from_str_radix(
+            filter[key].as_str().unwrap_or("").trim_start_matches("0x"),
+            16,
+        )
+        .map_err(io::Error::other)
+    };
+    Ok(quantity("toBlock")? - quantity("fromBlock")? + 1)
+}
+
 #[test]
 fn range_fallback_merges_and_remembers_endpoint_limit() -> io::Result<()> {
     let (result, requests) = run_server(
-        21,
+        5,
         |index, request| {
             if index == 0 {
                 (
@@ -76,24 +88,13 @@ fn range_fallback_merges_and_remembers_endpoint_limit() -> io::Result<()> {
         },
     )?;
     let (first, second) = result.map_err(io::Error::other)?;
-    assert_eq!(first.len(), 10);
-    assert_eq!(second.len(), 10);
-    assert_eq!(first[0], "0x1");
-    assert_eq!(first[9], "0x5b");
-    for request in &requests[1..] {
-        let filter = &request["params"][0];
-        let quantity = |key| {
-            u64::from_str_radix(
-                filter[key].as_str().unwrap_or("").trim_start_matches("0x"),
-                16,
-            )
-        };
-        assert_eq!(
-            quantity("toBlock").map_err(io::Error::other)?
-                - quantity("fromBlock").map_err(io::Error::other)?,
-            9
-        );
-    }
+    assert_eq!(first, ["0x1", "0x33"]);
+    assert_eq!(second, ["0x65", "0x97"]);
+    let spans = requests
+        .iter()
+        .map(requested_span)
+        .collect::<io::Result<Vec<_>>>()?;
+    assert_eq!(spans, [100, 50, 50, 50, 50]);
     Ok(())
 }
 
@@ -143,7 +144,38 @@ fn archive_error_with_range_text_does_not_cache() -> io::Result<()> {
 }
 
 #[test]
-fn invalid_params_range_error_splits_and_failed_retry_returns_original() -> io::Result<()> {
+fn failed_probe_at_minimum_span_returns_original_error() -> io::Result<()> {
+    let (result, requests) = run_server(
+        5,
+        |_, _| {
+            (
+                200,
+                json!({"id":1,"error":{"code":-32602,"message":"block range too large"}}),
+            )
+        },
+        |rpc| {
+            let result = rpc.call_single::<Vec<Value>>(
+                "eth_getLogs",
+                json!([{"fromBlock":"0x1", "toBlock":"0x64"}]),
+            );
+            (result, rpc.rpc_telemetry_snapshot())
+        },
+    )?;
+    assert!(matches!(
+        result.0,
+        Err(evm_rpc::RpcError::RpcProtocol { code: -32602, .. })
+    ));
+    assert!(result.1.providers[0].log_range_limit.is_none());
+    let spans = requests
+        .iter()
+        .map(requested_span)
+        .collect::<io::Result<Vec<_>>>()?;
+    assert_eq!(spans, [100, 50, 25, 12, 10]);
+    Ok(())
+}
+
+#[test]
+fn probe_non_range_error_returns_without_caching() -> io::Result<()> {
     let (result, requests) = run_server(
         2,
         |index, _| {
@@ -157,17 +189,23 @@ fn invalid_params_range_error_splits_and_failed_retry_returns_original() -> io::
             }
         },
         |rpc| {
-            rpc.call_single::<Vec<Value>>(
+            let result = rpc.call_single::<Vec<Value>>(
                 "eth_getLogs",
                 json!([{"fromBlock":"0x1", "toBlock":"0x64"}]),
-            )
+            );
+            (result, rpc.rpc_telemetry_snapshot())
         },
     )?;
     assert!(matches!(
-        result,
-        Err(evm_rpc::RpcError::RpcProtocol { code: -32602, .. })
+        result.0,
+        Err(evm_rpc::RpcError::RpcProtocol { code: 429, .. })
     ));
-    assert_eq!(requests.len(), 2);
+    assert!(result.1.providers[0].log_range_limit.is_none());
+    let spans = requests
+        .iter()
+        .map(requested_span)
+        .collect::<io::Result<Vec<_>>>()?;
+    assert_eq!(spans, [100, 50]);
     Ok(())
 }
 
@@ -191,7 +229,7 @@ fn unrelated_bad_request_falls_back_and_returns_original_error() -> io::Result<(
 #[test]
 fn result_count_limit_triggers_fallback() -> io::Result<()> {
     let (result, requests) = run_server(
-        11,
+        3,
         |index, _| {
             if index == 0 {
                 (
@@ -211,9 +249,13 @@ fn result_count_limit_triggers_fallback() -> io::Result<()> {
         },
     )?;
     assert!(result.0.is_ok());
-    assert_eq!(requests.len(), 11);
+    let spans = requests
+        .iter()
+        .map(requested_span)
+        .collect::<io::Result<Vec<_>>>()?;
+    assert_eq!(spans, [100, 50, 50]);
     let status = serde_json::to_value(result.1)?;
-    assert_eq!(status["providers"][0]["log_range_limit"]["span"], 10);
+    assert_eq!(status["providers"][0]["log_range_limit"]["span"], 50);
     assert!(
         (1..=900).contains(
             &status["providers"][0]["log_range_limit"]["expires_in_secs"]
