@@ -1,0 +1,21 @@
+[package]
+name = "evm-rpc"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+description = "Domain-independent EVM RPC transport and subscriptions."
+
+[dependencies]
+alloy-sol-types = "1.7"
+derive_builder = "0.20"
+hex = "0.4"
+alloy-primitives = { version = "1", features = ["serde"] }
+tungstenite = { version = "0.28", default-features = false, features = ["handshake", "rustls-tls-webpki-roots"] }
+ureq = { version = "3.5", features = ["json"] }
+serde_json = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+typed-builder = "0.23.2"
+
+[lints]
+workspace = true

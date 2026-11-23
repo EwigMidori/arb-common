@@ -1,0 +1,16 @@
+[package]
+name = "evm-tx"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+description = "Domain-independent transaction encoding, signing, and fee arithmetic."
+
+[dependencies]
+alloy-primitives = "1"
+alloy-rlp = "0.3"
+derive_builder = "0.20"
+k256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
+thiserror = "2"
+
+[lints]
+workspace = true

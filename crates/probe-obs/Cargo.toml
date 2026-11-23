@@ -1,0 +1,18 @@
+[package]
+name = "probe-obs"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+description = "Metrics serving and notification infrastructure."
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+ureq = { version = "3.5", features = ["json"] }
+derive_builder = "0.20"
+thiserror = "2"
+
+[dev-dependencies]
+serde_json = "1"
+
+[lints]
+workspace = true

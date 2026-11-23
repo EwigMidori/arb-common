@@ -1,0 +1,9 @@
+[allowed]
+evm-rpc = []
+evm-tx = []
+revm-fork = ["evm-rpc"]
+probe-obs = []
+
+[purity]
+roots = []
+forbidden = []
